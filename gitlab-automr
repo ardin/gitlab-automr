@@ -1,0 +1,297 @@
+#!/usr/bin/env python
+
+"""
+author: Piotr Wasilewski
+name: gitlab-automr
+description: gitlab auto merge requests
+"""
+
+# pip install PyYaml
+
+import requests
+import urllib.parse
+import os.path
+import re
+import json
+from datetime import datetime
+import argparse
+import yaml
+
+lock_file="/tmp/gitlab-automr.lock"
+
+# argparse
+parser = argparse.ArgumentParser(description='GitLab Auto Merge Request')
+parser.add_argument('--config', type=str, help='config file')
+parser.add_argument('--debug', action="store_true", default=False)
+parser.add_argument('--dry-run', action="store_true", default=False)
+
+args = parser.parse_args()
+config = args.config
+debug = args.debug
+
+# helpers
+class obj:
+    def __init__(self, dict1):
+        self.__dict__.update(dict1)
+
+def d2o(d):
+    return json.loads(json.dumps(d), object_hook=obj)
+
+def lock():
+    if os.path.isfile(lock_file):
+        error("Program already locked %s" % lock_file)
+        exit(1)
+    else:
+        os.mknod(lock_file)
+
+def unlock():
+    if os.path.isfile(lock_file):
+        os.remove(lock_file)
+
+def dbg(msg):
+    if debug is True:
+        print("DEBUG: %s" % msg)
+
+def now_ymd():
+    return(datetime.today().strftime('%Y-%m-%d'))
+
+def now_time():
+    return(datetime.today().strftime('%H:%M:%S'))
+
+def log(msg, code='INFO', mid=''):
+    with open("/tmp/gitlab-automr.log", "a") as myfile:
+        myfile.write("{} | {} | {:7} | {:5} | {}\n".format(now_ymd(), now_time(), code, mid, msg) )
+
+def warning(msg, mid=''):
+    print(color.WARNING + "\n    Skipping: %s" % msg + color.END)
+    log(msg, 'WARNING', mid)
+
+def error(msg, mid=''):
+    print(color.FAIL + "\n    Error: %s" % msg + color.END)
+    log(msg, 'ERROR', mid)
+
+def success(msg, mid=''):
+    print(color.GREEN + "\n    %s" % msg + color.END)
+    log(msg, 'SUCCESS', mid)
+
+def info(msg, mid=''):
+    print("%s" % msg)
+    log(msg, 'INFO', mid)
+
+class color:
+    HEADER = '\033[95m'
+    END = '\033[0m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    BLUE = '\033[94m'
+    GREEN = '\033[92m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+    YELLOW = '\033[33m'
+
+
+class GitLab:
+
+    def __init__(self, server, token, api_ver, project_name, assignee_username,
+            allowed_usernames=[], allowed_paths=[]):
+
+        self.server = server
+        self.token = token
+        self.api_ver = api_ver
+        self.project_name = project_name
+        self.assignee_username = assignee_username
+        self.allowed_usernames = allowed_usernames
+        self.allowed_paths = allowed_paths
+
+        # autogen
+        self.project_id = 0
+
+        # set project_id
+        gitlab_project_name = urllib.parse.quote_plus(self.project_name)
+        data = self.get('/projects/%s' % gitlab_project_name)
+        if 'id' in data:
+            self.project_id = data['id']
+
+    def __str__(self):
+        return("GitLab server: %s\nProject id: %s" % ( self.server, self.project_id ))
+
+
+    def get(self,url='/'):
+        url = '%s/api/%s/%s' % (self.server, self.api_ver, url)
+        headers = {
+            'PRIVATE-TOKEN': self.token
+        }
+        r = requests.get(url, headers=headers)
+
+        if r.status_code != 200:
+            error(url)
+            error(r.text)
+            error(r.status_code)
+            error('ERROR GET')
+
+        return r.json()
+
+    def put (self,url='/', data={}):
+        url = '%s/api/%s/%s' % (self.server, self.api_ver, url)
+        headers = {
+            'PRIVATE-TOKEN': self.token
+        }
+        r = requests.put(url, headers=headers, data=data)
+        return r    
+
+    def merge_requests(self,author_username):
+        req = self.get('/projects/%s/merge_requests?author_username=%s&target_branch=master&assignee_username=%s&state=opened' % (self.project_id, author_username, self.assignee_username))
+        return req
+
+    def accept_merge_request(self,mr_iid):
+        req = self.put('/projects/%s/merge_requests/%s/merge' % (self.project_id, mr_iid), data={})
+        dbg('/projects/%s/merge_requests/%s/merge' % (self.project_id, mr_iid))
+        if req.status_code == 200:
+            success("Merged", mr_iid)
+        else:
+            error("Something wrong with merge")
+            error(req.text)
+        return(req)
+
+    def automr(self):
+        
+        for user in self.allowed_usernames:
+            merge_req = self.merge_requests(author_username=user)
+            if len(merge_req) > 0:
+                for mr_d in merge_req:
+                    mr = d2o(mr_d)
+                    print(color.YELLOW + mr.title + color.END + " by " + color.BLUE + user + color.END)
+                    log(mr.title + " by " + user, 'INFO   ', str(mr.iid))
+                    dbg("    iid:           %s" % mr.iid)
+                    dbg("    has_conflicts: %s" % mr.has_conflicts)
+                    dbg("    state:         %s" % mr.state)
+                    dbg("    web_url:       %s" % mr.web_url)
+                    dbg("    source_branch: %s" % mr.source_branch)
+
+                    info(mr.references.full  + " " + mr.state + " " + mr.updated_at, str(mr.iid))
+                    
+                    if mr.work_in_progress == True:
+                        warning("merge request is work in progress", str(mr.iid))
+
+                    elif mr.has_conflicts == True:
+                        warning("merge request have conflicts", str(mr.iid))
+
+                    # if True:
+                    else:
+                        # diffs 
+                        diffs = self.get('/projects/%s/repository/commits/%s/diff' % (self.project_id, mr.source_branch))
+                        # print(json.dumps(diffs,indent=4))
+
+                        allow = True
+                        for diff_d in diffs:
+                            diff = d2o(diff_d)
+                            
+                            if self.check_allowed_path(diff.old_path, str(mr.iid)) is False or \
+                                    self.check_allowed_path(diff.new_path, str(mr.iid)) is False:
+                                allow = False
+                                break
+
+                        if allow:
+                            if args.dry_run:
+                                success("Merged (DRY RUN MODE)", str(mr.iid))
+                            else:
+                                req = gitlab.accept_merge_request(mr_iid=mr.iid)
+                            
+                    print()
+                    log('---', 'INFO', str(mr.iid))
+
+    def check_allowed_path(self, path, mid=''):
+       for allowed_path in self.allowed_paths:
+           try:
+               regex = re.search(r"%s$" % allowed_path, path)
+           except:
+               warning("can't parse regex %s, skipping" % allowed_path, mid)
+               return False
+           if regex:
+               if regex.group():
+                   dbg("  path %s is allowed" % path)
+                   return(True)
+       warning("not allowed path %s" % path, mid)
+       return False
+
+
+if __name__ == "__main__":
+
+    lock()
+
+    if args.config:
+        if os.path.isfile(config):
+            with open(config) as f:
+                conf_d = yaml.load(f, Loader=yaml.FullLoader)
+                if 'gitlab_automr' not in conf_d:
+                    print("ERROR: there is no gitlab_automr key in config file")
+                    unlock()
+                    exit(1)
+
+                dbg("config: ")
+                for repo in conf_d['gitlab_automr']:
+                    repo_d = conf_d['gitlab_automr'][repo]
+                    dbg("    current repo: " + repo)
+                    r = d2o(repo_d)
+
+                    required = [ 'address', 'token', 'api_ver', 'project_name', 'assignee_username' , 'allowed_usernames', 'allowed_paths']
+                    for req in required:
+                        if req not in repo_d:
+                            error("ERROR: there is no '%s' in config file (%s context) " % (req, repo) )
+                            unlock()
+                            exit(1)
+                        if req == 'allowed_usernames':
+                            if type(repo_d['allowed_usernames']) is str:
+                                error("allowed usernames must be list")
+                                unlock()
+                                exit(1)
+                        if req == 'allowed_paths':
+                            if type(repo_d['allowed_paths']) is str:
+                                error("allowed paths must be list")
+                                unlock()
+                                exit(1)
+
+                    # gitlab instance for each config block
+                    gitlab = GitLab(server=r.address, token=r.token, api_ver=r.api_ver, project_name=r.project_name, \
+                            assignee_username=r.assignee_username, allowed_usernames=r.allowed_usernames, allowed_paths=r.allowed_paths)
+                    gitlab.automr()
+                    del gitlab
+        else:
+            error("There is no config file")
+            unlock()
+            exit(1)
+
+    else:
+        # read config from variables
+        vars_d = [
+            'GITLAB_ADDRESS', 
+            'GITLAB_TOKEN', 
+            'GITLAB_PROJECT_NAME', 
+            'GITLAB_ASSIGNEE_USERNAME',
+            'GITLAB_ALLOWED_USERNAMES', 
+            'GITLAB_ALLOWED_PATHS', 
+        ]
+        GITLAB_API_VER=os.environ.get('GITLAB_API_VER', 'v4')
+ 
+        # check variables
+        for e in vars_d: 
+            locals()[e] = os.environ.get(e)
+            if locals()[e] is None:
+                error("variable %s is not configured" % e)
+                unlock()
+                exit(1)
+ 
+        allowed_usernames = []
+        for user in GITLAB_ALLOWED_USERNAMES.split():
+            allowed_usernames.append(user)
+ 
+        allowed_paths = []
+        for path in GITLAB_ALLOWED_PATHS.split():
+            allowed_paths.append(path)
+ 
+        gitlab = GitLab(server=GITLAB_ADDRESS, token=GITLAB_TOKEN, api_ver=GITLAB_API_VER, project_name=GITLAB_PROJECT_NAME, \
+                assignee_username=GITLAB_ASSIGNEE_USERNAME, allowed_usernames=allowed_usernames, allowed_paths=allowed_paths)
+        gitlab.automr()
+
+    unlock()
+    
