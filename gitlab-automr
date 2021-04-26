@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 
 """
-author: Piotr Wasilewski
 name: gitlab-automr
 description: gitlab auto merge requests
 """
