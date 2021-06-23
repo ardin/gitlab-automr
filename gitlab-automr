@@ -251,10 +251,15 @@ if __name__ == "__main__":
                                 exit(1)
 
                     # gitlab instance for each config block
-                    gitlab = GitLab(server=r.address, token=r.token, api_ver=r.api_ver, project_name=r.project_name, \
-                            assignee_username=r.assignee_username, allowed_usernames=r.allowed_usernames, allowed_paths=r.allowed_paths)
-                    gitlab.automr()
-                    del gitlab
+                    try:
+                        gitlab = GitLab(server=r.address, token=r.token, api_ver=r.api_ver, project_name=r.project_name, \
+                                assignee_username=r.assignee_username, allowed_usernames=r.allowed_usernames, allowed_paths=r.allowed_paths)
+                        gitlab.automr()
+                        del gitlab
+                    except Exception as e:
+                        error("There's something with gitlab: %s" % e)
+                        unlock()
+                        exit(1)
         else:
             error("There is no config file")
             unlock()
